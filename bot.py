@@ -179,8 +179,7 @@ async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     _pending_oauth[state] = chat_id
 
-    callback_url = f"{PUBLIC_URL}/oauth/callback"
-    auth_url     = get_auth_url(state, callback_url)
+    auth_url = get_auth_url(state)
 
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔑 Connect Google Account", url=auth_url)
