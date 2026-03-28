@@ -1,0 +1,463 @@
+"""
+Telegram → YouTube uploader bot.
+
+- python-telegram-bot handles commands / UI
+- Telethon userbot handles large-file downloads (no 20 MB limit)
+- Google OAuth2 is handled inside the bot (callback via built-in HTTP server)
+- YouTube upload uses resumable API (any file size)
+"""
+
+import asyncio
+import logging
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
+
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ConversationHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+from telethon import TelegramClient, events
+
+from auth import (
+    get_auth_url,
+    exchange_code_for_tokens,
+    load_credentials,
+    is_authenticated,
+)
+from downloader import (
+    get_client as get_telethon,
+    is_userbot_logged_in,
+    send_login_code,
+    sign_in,
+    sign_out_userbot,
+    SESSION_PATH,
+    API_ID,
+    API_HASH,
+)
+from uploader import upload_video
+
+logging.basicConfig(
+    format  = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level   = logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# ── Env ───────────────────────────────────────────────────────────────────────
+OWNER_ID   = int(os.environ["OWNER_TELEGRAM_ID"])
+BOT_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
+OAUTH_PORT = int(os.environ.get("OAUTH_CALLBACK_PORT", "8080"))
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
+
+# ConversationHandler states
+AWAIT_PHONE = 1
+AWAIT_CODE  = 2
+AWAIT_2FA   = 3
+
+# Shared across threads
+_pending_oauth: dict[str, int] = {}
+_ptb_app = None   # set after build
+
+# Stores phone + hash during login conversation
+_login_state: dict[int, dict] = {}
+
+
+# ── OAuth callback HTTP server ────────────────────────────────────────────────
+
+class OAuthHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path != "/oauth/callback":
+            self._respond(404, "Not found")
+            return
+
+        params = parse_qs(parsed.query)
+        codes  = params.get("code")
+        state  = params.get("state", [None])[0]
+
+        if not codes or not state:
+            self._respond(400, "Missing code or state")
+            return
+
+        chat_id = _pending_oauth.pop(state, None)
+        if chat_id is None:
+            self._respond(400, "Unknown state — run /auth again")
+            return
+
+        try:
+            exchange_code_for_tokens(codes[0])
+            self._respond(200, "✅ Authenticated! Return to Telegram.")
+            asyncio.run_coroutine_threadsafe(
+                _ptb_app.bot.send_message(
+                    chat_id,
+                    "✅ *Google account connected!*\n"
+                    "You can now forward videos to upload them to YouTube.",
+                    parse_mode="Markdown",
+                ),
+                _ptb_app.update_queue._loop,  # type: ignore[attr-defined]
+            )
+        except Exception as e:
+            logger.exception("Token exchange failed")
+            self._respond(500, f"Auth failed: {e}")
+
+    def _respond(self, status: int, body: str):
+        data = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def _run_oauth_server():
+    srv = HTTPServer(("0.0.0.0", OAUTH_PORT), OAuthHandler)
+    logger.info("OAuth server listening on :%s", OAUTH_PORT)
+    srv.serve_forever()
+
+
+# ── Owner guard ───────────────────────────────────────────────────────────────
+
+def owner_only(func):
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != OWNER_ID:
+            await update.message.reply_text("⛔ Private bot.")
+            return
+        return await func(update, ctx)
+    return wrapper
+
+
+# ── /start ────────────────────────────────────────────────────────────────────
+
+@owner_only
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    yt_ok  = is_authenticated()
+    tg_ok  = await is_userbot_logged_in()
+    yt_str = "✅ Connected" if yt_ok  else "❌ Run /auth"
+    tg_str = "✅ Logged in" if tg_ok  else "❌ Run /login"
+    await update.message.reply_text(
+        "🎬 *YouTube Uploader Bot*\n\n"
+        f"YouTube account: {yt_str}\n"
+        f"Telegram userbot: {tg_str}\n\n"
+        "Forward any video once both show ✅.",
+        parse_mode="Markdown",
+    )
+
+
+# ── /status ───────────────────────────────────────────────────────────────────
+
+@owner_only
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    yt_ok = is_authenticated()
+    tg_ok = await is_userbot_logged_in()
+
+    lines = [
+        f"*YouTube:* {'✅ authenticated' if yt_ok else '❌ not connected'}",
+        f"*Userbot:* {'✅ logged in'     if tg_ok else '❌ not logged in'}",
+    ]
+    if yt_ok:
+        creds = load_credentials()
+        lines.append(f"*Token valid:* `{not creds.expired}`")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ── /auth (YouTube OAuth2) ────────────────────────────────────────────────────
+
+@owner_only
+async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    import secrets
+    state   = secrets.token_urlsafe(16)
+    chat_id = update.effective_chat.id
+    _pending_oauth[state] = chat_id
+
+    callback_url = f"{PUBLIC_URL}/oauth/callback"
+    auth_url     = get_auth_url(state, callback_url)
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔑 Connect Google Account", url=auth_url)
+    ]])
+    await update.message.reply_text(
+        "Tap the button to authorise YouTube access.\n"
+        "Come back after approving — the bot will confirm automatically.",
+        reply_markup=kb,
+    )
+
+
+@owner_only
+async def cmd_revoke_yt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    path = os.path.join(os.environ.get("DATA_DIR", "data"), "token.json")
+    if os.path.exists(path):
+        os.remove(path)
+        await update.message.reply_text("🗑 YouTube token revoked. Use /auth to reconnect.")
+    else:
+        await update.message.reply_text("No YouTube token found.")
+
+
+# ── /login (Telegram userbot) — ConversationHandler ──────────────────────────
+
+@owner_only
+async def cmd_login_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await is_userbot_logged_in():
+        await update.message.reply_text(
+            "✅ Userbot is already logged in.\n"
+            "Use /logoutuserbot to disconnect."
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "📱 *Telegram Userbot Login*\n\n"
+        "Send your phone number in international format:\n"
+        "Example: `+919876543210`\n\n"
+        "Send /cancel to abort.",
+        parse_mode="Markdown",
+    )
+    return AWAIT_PHONE
+
+
+async def login_got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return ConversationHandler.END
+
+    phone = update.message.text.strip()
+    await update.message.reply_text(f"Sending code to {phone}…")
+
+    try:
+        phone_code_hash = await send_login_code(phone)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to send code: {e}")
+        return ConversationHandler.END
+
+    _login_state[update.effective_user.id] = {
+        "phone":           phone,
+        "phone_code_hash": phone_code_hash,
+    }
+
+    await update.message.reply_text(
+        "✉️ Code sent! Enter the code Telegram sent you.\n"
+        "Format it *with spaces* between digits as shown in the app, "
+        "or just paste it straight (e.g. `12345`).\n\n"
+        "Send /cancel to abort.",
+        parse_mode="Markdown",
+    )
+    return AWAIT_CODE
+
+
+async def login_got_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return ConversationHandler.END
+
+    code  = update.message.text.strip().replace(" ", "")
+    state = _login_state.get(update.effective_user.id, {})
+
+    try:
+        await sign_in(
+            phone          = state["phone"],
+            code           = code,
+            phone_code_hash= state["phone_code_hash"],
+        )
+        _login_state.pop(update.effective_user.id, None)
+        await update.message.reply_text(
+            "✅ *Userbot logged in!*\n"
+            "You can now forward videos up to 2 GB.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    except RuntimeError as e:
+        if str(e) == "2FA_REQUIRED":
+            await update.message.reply_text(
+                "🔐 Two-factor authentication is enabled.\n"
+                "Send your 2FA cloud password:",
+            )
+            return AWAIT_2FA
+        await update.message.reply_text(f"❌ Login failed: {e}")
+        _login_state.pop(update.effective_user.id, None)
+        return ConversationHandler.END
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Login failed: {e}")
+        _login_state.pop(update.effective_user.id, None)
+        return ConversationHandler.END
+
+
+async def login_got_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return ConversationHandler.END
+
+    password = update.message.text.strip()
+    state    = _login_state.get(update.effective_user.id, {})
+
+    try:
+        await sign_in(
+            phone          = state["phone"],
+            code           = "",          # already used
+            phone_code_hash= state["phone_code_hash"],
+            password       = password,
+        )
+        _login_state.pop(update.effective_user.id, None)
+        await update.message.reply_text(
+            "✅ *Userbot logged in!*\n"
+            "You can now forward videos up to 2 GB.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ 2FA failed: {e}")
+        _login_state.pop(update.effective_user.id, None)
+
+    return ConversationHandler.END
+
+
+async def login_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    _login_state.pop(update.effective_user.id, None)
+    await update.message.reply_text("Login cancelled.")
+    return ConversationHandler.END
+
+
+@owner_only
+async def cmd_logout_userbot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        await sign_out_userbot()
+        await update.message.reply_text("✅ Userbot logged out.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}")
+
+
+# ── Video handler ─────────────────────────────────────────────────────────────
+
+@owner_only
+async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_authenticated():
+        await update.message.reply_text("❌ YouTube not connected. Run /auth first.")
+        return
+    if not await is_userbot_logged_in():
+        await update.message.reply_text("❌ Userbot not logged in. Run /login first.")
+        return
+
+    msg    = update.message
+    video  = msg.video or msg.document
+
+    if video is None:
+        await msg.reply_text("Please forward a video file.")
+        return
+
+    status_msg = await msg.reply_text("⬇️ Fetching video info…")
+
+    try:
+        # ── Bridge: fetch the raw Telethon message so downloader can use it ──
+        telethon_client = await get_telethon()
+        tg_msg = await telethon_client.get_messages(
+            entity = msg.chat_id,
+            ids    = msg.message_id,
+        )
+        if tg_msg is None:
+            raise RuntimeError(
+                "Userbot couldn't see this message.\n"
+                "Make sure you forwarded the video *to this bot's chat*, "
+                "and that the userbot account is a member of the source chat."
+            )
+
+        # Attach raw message so downloader.py can call download_media()
+        video._telethon_message = tg_msg
+
+        # ── Download ──────────────────────────────────────────────────────
+        from downloader import download_telegram_video
+        local_path, filename = await download_telegram_video(
+            ctx.bot, video, status_msg
+        )
+
+        # ── Title from caption or filename ────────────────────────────────
+        caption = msg.caption
+        if not caption and msg.forward_origin:
+            try:
+                caption = msg.forward_origin.sender_user.full_name
+            except AttributeError:
+                pass
+        title       = (caption or filename or "Uploaded via Telegram Bot")[:100]
+        description = f"Uploaded via Telegram Bot\nOriginal file: {filename}"
+
+        await status_msg.edit_text("📤 Uploading to YouTube…")
+
+        # ── Upload (runs in thread — blocking googleapiclient) ─────────────
+        loop = asyncio.get_event_loop()
+
+        def _progress_cb(pct: int):
+            asyncio.run_coroutine_threadsafe(
+                status_msg.edit_text(f"📤 Uploading to YouTube… {pct}%"),
+                loop,
+            )
+
+        video_url = await asyncio.to_thread(
+            upload_video,
+            local_path,
+            title       = title,
+            description = description,
+            progress_cb = _progress_cb,
+        )
+
+        await status_msg.edit_text(
+            f"✅ *Uploaded!*\n\n🎬 [{title[:60]}]({video_url})",
+            parse_mode              = "Markdown",
+            disable_web_page_preview= False,
+        )
+
+    except Exception as e:
+        logger.exception("Upload pipeline failed")
+        await status_msg.edit_text(f"❌ Error: {e}")
+
+    finally:
+        try:
+            if "local_path" in locals() and os.path.exists(local_path):
+                os.remove(local_path)
+        except Exception:
+            pass
+
+
+# ── App setup ─────────────────────────────────────────────────────────────────
+
+def main():
+    global _ptb_app
+
+    # OAuth HTTP server in background
+    threading.Thread(target=_run_oauth_server, daemon=True).start()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    _ptb_app = app
+
+    # /login conversation
+    login_conv = ConversationHandler(
+        entry_points = [CommandHandler("login", cmd_login_start)],
+        states = {
+            AWAIT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_got_phone)],
+            AWAIT_CODE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, login_got_code)],
+            AWAIT_2FA:   [MessageHandler(filters.TEXT & ~filters.COMMAND, login_got_2fa)],
+        },
+        fallbacks = [CommandHandler("cancel", login_cancel)],
+        conversation_timeout = 300,
+    )
+
+    app.add_handler(CommandHandler("start",         cmd_start))
+    app.add_handler(CommandHandler("auth",          cmd_auth))
+    app.add_handler(CommandHandler("status",        cmd_status))
+    app.add_handler(CommandHandler("revoke",        cmd_revoke_yt))
+    app.add_handler(CommandHandler("logoutuserbot", cmd_logout_userbot))
+    app.add_handler(login_conv)
+    app.add_handler(MessageHandler(
+        filters.VIDEO | filters.Document.VIDEO,
+        handle_video,
+    ))
+
+    logger.info("Bot polling…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
